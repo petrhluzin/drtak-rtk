@@ -98,6 +98,16 @@
 .equ rtkSliceCounter, timer_counter
 .lcomm timer_counter, 1 ; 8-bit counter
 
+#if 0  /* GAS does not support CFI directives. */
+#define CFI_STARTPROC .cfi_startproc
+#define CFI_ADJUST_CFA_OFFSET(n) .cfi_adjust_cfa_offset n
+#define CFI_ENDPROC .cfi_endproc
+#else
+#define CFI_STARTPROC
+#define CFI_ADJUST_CFA_OFFSET(n)
+#define CFI_ENDPROC
+#endif
+
 .text
 ; when switch_context is `called', it triggers the kernel's context switching
 ; mechanism:
@@ -372,12 +382,17 @@ switch_normal_ret: ; normal return with I-bit cleared
 ;   calling thread (first thread)
 .global rtkInitialize
 rtkInitialize:
+  CFI_STARTPROC
   ; preserve registers
   push r31
+  CFI_ADJUST_CFA_OFFSET( +1 )
   in   r31,_SFR_IO_ADDR(SREG)
   cli
+  ; Here (after the CLI) is the last place where gdb-7.3 can unwind the stack
   push r31
+  CFI_ADJUST_CFA_OFFSET( +1 )
   push r30
+  CFI_ADJUST_CFA_OFFSET( +1 )
   push r29
   push r28
   push r27
@@ -390,6 +405,7 @@ rtkInitialize:
   clr  r24
   sts  scheduled+queue_head,r24
   sts  scheduled+queue_head+1,r24
+  CFI_ENDPROC
 
   ; initialize elements in queues to point to next
   ldi  r24,RTK_NUMQUEUES ; r24 is a counter
