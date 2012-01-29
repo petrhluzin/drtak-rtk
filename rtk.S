@@ -1,0 +1,1279 @@
+/*
+ * Copyright (C) 2002-2004 Tak Auyeung 
+ * (tauyeung@ieee.org or visit www.drtak.org) 
+ *
+ * This file is part of EbO (Embedded-but-Open).
+ *
+ * EbO is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ *
+ * EbO is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+ *
+ *
+ * */
+; 
+;
+; This is the rtk.S source file. rtk (simply real-time kernel) is a small
+; OS for AVR MCUs. Its foot print is relatively small, but offers most
+; important features such as:
+;
+; - preemptive multithreading
+; - cooperative multithreading
+; - real-time scheduling
+; - thread synchronization via semaphores
+; - round-robin scheduling
+; - priority queues
+; 
+; This is work-in-progress as of now (8/2002). Further work will include
+; optimization for speed AND size, as well as a gentler interface to
+; provide time slicing (you can do it now, but it is not very efficient).
+
+;#include <avr/io.h>
+#include <avr/io.h>
+#include "rtk.h"
+;#ifndef __SFR_OFFSET
+;#define __SFR_OFFSET 0
+;#endif
+; AVR real time kernel
+
+; struct thread definition
+.equ thread_SP,  0 ; stack pointer for this thread
+.equ thread_next, thread_SP+2 ; points to the next thread of this queue
+.equ thread_prev, thread_next+2 ; points to prev thread of this queue
+.equ thread_flags, thread_prev+2 ; flags
+.equ thread_time, thread_flags+1 ; time, 6-byte quantity for ticks
+.equ thread_queue, thread_time+6 ; points to the default ready queue
+;.equ ... thread_queue+2
+.equ thread_size, thread_queue+2 ; size of a queue structure
+
+; struct queue definition
+.equ queue_next,  0  ; a queue points to the next queue (only for priority q)
+.equ queue_head, queue_next+2 ; a queue also has a head
+;.equ ... queue_head+2
+.equ queue_size, queue_head+2 ; size of a queue
+
+; struct semaphore definition
+.equ semaphore_value, 0 ; a semaphore has a lock state
+.equ semaphore_queue, semaphore_value+1 ; a semaphore also maintains a queue of awaiting
+                               ; threads
+.equ semaphore_size, semaphore_queue+queue_size ; size of a semaphore
+
+.data
+; reserve space for the kernel code
+.lcomm kernel_low_SP, RTK_STACK_SIZE
+.equ kernel_high_SP, kernel_low_SP+RTK_STACK_SIZE
+
+; allocate for the scheduled task queue (sorted by due time)
+.global rtkScheduled
+.equ rtkScheduled, scheduled
+.lcomm scheduled, queue_size
+
+; allocate for the actual queues, lowest address one has highest priority
+.global rtkQueues
+.equ rtkQueues, queues
+.lcomm queues, RTK_NUMQUEUES * queue_size
+
+; allocate for tick_count, some logic is responsible for updating it!
+.global rtkTickCount
+.lcomm rtkTickCount, 6 ; 6 bytes for ticks queues
+
+.global rtkCurrentThread
+.equ rtkCurrentThread, current_thread
+.lcomm current_thread, 2 ; not thread_size because this is just a pointer
+
+.global rtkSliceScaler
+.equ rtkSliceScaler, scalar
+.lcomm scalar, 1 ; use 8-bit for the prescalar (# ISRs before context switch)
+
+.global rtkSliceCounter
+.equ rtkSliceCounter, timer_counter
+.lcomm timer_counter, 1 ; 8-bit counter
+
+.text
+; when switch_context is `called', it triggers the kernel's context switching
+; mechanism:
+; this logic attempts to switch the current thread out, and grab the 
+; head of the queue of the highest priority to become the new
+; current thread
+; this logic also looks at the `scheduled' queue and see if a thread or
+; threads scheduled is due to become ready. All due threads are added back
+; to their respective queues at the tails. 
+; if no thread is ready, this logic executes a sleep instruction and
+; rechecks for thread readiness when it wakes up (most likely from an 
+; interrupt)
+;
+; the caller of switch_context is responsible for placing the return
+; address (saved PC value) on the stack
+.global rtkThreadYield
+rtkThreadYield:
+switch_context:
+  ; first, save all registers
+  push r31
+  in   r31,_SFR_IO_ADDR(SREG)
+  cli
+  push r31
+  push r30
+  push r29
+  push r28
+  push r27
+  push r26
+  push r25
+  push r24
+switch_context_r23:
+  push r23
+  push r22
+switch_context_r21:
+  push r21
+  push r20
+  push r19
+  push r18
+  push r17
+  push r16
+  push r15
+  push r14
+  push r13
+  push r12
+  push r11
+  push r10
+  push r9
+  push r8
+  push r7
+  push r6
+  push r5
+  push r4
+  push r3
+  push r2
+  push r1
+  push r0
+
+  ; at this point, we should disable interrupts
+;switch_context_bare:
+;  cli
+  ; next, save the SP
+  lds  r30,current_thread
+  lds  r31,current_thread+1
+  ; adiw r26,thread_SP
+  ; Z points to the SP
+  in   r16,_SFR_IO_ADDR(SPL)
+  std  Z+thread_SP,r16
+  in   r16,_SFR_IO_ADDR(SPH)
+  std  Z+thread_SP+1,r16
+;  ldi  r16, RTK_THREADREADY
+;  std  Z+thread_flags,r16
+
+  ; at this point, the context of the current thread is saved
+  ; time to figure out the next thread to run
+
+  ; note that we do not advance the queue head or detach a thread
+  ; from a ready queue, these actions are supposed to be done
+  ; before context switch logic is used!
+
+  ; now use kernel stack space so we don't need to reserve this much
+  ; for each thread stack
+kernel_core:
+  ldi  r16,hi8(kernel_high_SP-1)
+  out  _SFR_IO_ADDR(SPH),r16
+  ldi  r16,lo8(kernel_high_SP-1)
+  out  _SFR_IO_ADDR(SPL),r16
+
+  ; now we can write the scheduling logic
+
+  ; first, scan scheduling queue to see if the current time tick should
+  ; activate awaiting threads
+find_scheduled:
+  ;sbi  PORTD,7
+  lds  r30,scheduled+queue_head
+  lds  r31,scheduled+queue_head+1
+  ; Z is a copy of the head of the scheduled queue
+  mov  r0,r30
+  or   r0,r31
+  brne scheduled_not_empty
+  rjmp find_nonempty_queue ; if this is empty, look for ready threads
+
+  ; otherwise, check the thread at the head to see if it is time to
+  ; make it ready
+scheduled_not_empty:
+  mov  r28,r30
+  mov  r29,r31
+  adiw r28,thread_time
+  ; Y is now pointing to the LSB of the next activation time
+  ; compare thread activation time to kernel_tickcount
+  lds  r16,rtkTickCount
+  ld   r0,Y+
+  cp   r0,r16
+  lds  r16,rtkTickCount+1
+  ld   r0,Y+
+  cpc  r0,r16
+  lds  r16,rtkTickCount+2
+  ld   r0,Y+
+  cpc  r0,r16
+  lds  r16,rtkTickCount+3
+  ld   r0,Y+
+  cpc  r0,r16
+  lds  r16,rtkTickCount+4
+  ld   r0,Y+
+  cpc  r0,r16
+  lds  r16,rtkTickCount+5
+  ld   r0,Y+
+  cpc  r0,r16
+  breq trigger_thread ; trigger thread if the time matches or
+  brcs trigger_thread ; if activation time is less than kernel tickcount
+  rjmp find_nonempty_queue
+trigger_thread:
+  ldi  r26,lo8(scheduled+queue_head)
+  ldi  r27,hi8(scheduled+queue_head) ; &schedule.queue_head
+  rcall detach_thread ; detaches thread pointed to by Z from the queue
+                     ; head at address X
+
+  ; find out which queue this thread should belong to once triggered
+reattach_thread:
+  rcall attach_thread ; attaches thread pointed to by Z to its default
+                     ; ready queue
+  rjmp find_scheduled ; do this all over again, there may be multiple
+                      ; threads ready by this tick count
+
+find_nonempty_queue:
+  ; then, start with the high priority queue, see which queue is non-empty
+  ldi  r30,lo8(queues) ; queues is an array of queue structs
+  ldi  r31,hi8(queues) ; just get its address to get to the first item
+  ; Z points to the first priority queue (highest priority)
+check_queue:
+  mov  r0,r30
+  or   r0,r31
+  breq no_thread_is_ready ; even the lowest priority queue is empty
+  ; otherwise, let's check whether this queue is empty or not
+  ldd  r28,Z+queue_head
+  ldd  r29,Z+queue_head+1
+  ; Y becomes a copy of queue_head, points to the first ready thread
+  mov  r0,r28
+  or   r0,r29
+  brne use_this_queue ; if queue_head is not NULL, let's use this queue
+  ; this queue is empty, move on to the next one
+  ldd  r0,Z+queue_next
+  ldd  r31,Z+queue_next+1
+  mov  r30,r0
+  rjmp check_queue
+
+no_thread_is_ready:
+  ; TODO: this logic may not be correct!
+
+  ; no thread is ready at this point, got nothing to do!
+  ; let's first indicate there is no current_thread
+  clr  r0
+  sts  current_thread,r0
+  sts  current_thread+1,r0
+  ; then sleep
+  sei
+  ; reenable interrupts, otherwise NO EVENTS can occur and the system
+  ; cannot awaken threads
+  sleep
+  cli
+  ; hopefully, when an interrupt awakens, a thread will 
+  ; be ready
+  rjmp find_scheduled ; check of scheduled threads again
+  
+use_this_queue:
+  ; Y points to the thread
+  ; first, advance the queue head
+  ldi  r16,RTK_THREADREADY
+  std  Y+thread_flags,r16 ; indicate thread is running
+  ldd  r0,Y+thread_next
+  std  Z+queue_head,r0
+  ldd  r0,Y+thread_next+1
+  std  Z+queue_head+1,r0
+  ; and remember this is the `current' thread
+  sts  current_thread,r28
+  sts  current_thread+1,r29
+  ; for the non-empty queue, find the thread at the head, use it as
+  ; the current_thread, then advance the head
+  ; next thread is now selected
+#if 0
+  ldi  r22,2
+  ldi  r23,0
+  ldi  r24,lo8(current_thread)
+  ldi  r25,hi8(current_thread)
+  rcall lcdHexDump
+#endif
+  lds  r26,current_thread
+  lds  r27,current_thread+1
+  adiw r26,thread_SP
+  ; X points to the SP
+  ld   r0,X+
+  out  _SFR_IO_ADDR(SPL),r0
+  ld   r0,X+
+  out  _SFR_IO_ADDR(SPH),r0
+  ; note that interrupt may be reenabled here!
+  pop  r0
+  pop  r1
+#if 0
+  tst  r1
+  breq r1Fine
+  lds  r30,PORTG
+  ldi  r31,0x10
+  eor  r30,r31
+  sts  PORTG,r30
+r1Fine:
+#endif
+  pop  r2
+  pop  r3
+  pop  r4
+  pop  r5
+  pop  r6
+  pop  r7
+  pop  r8
+  pop  r9
+  pop  r10
+  pop  r11
+  pop  r12
+  pop  r13
+  pop  r14
+  pop  r15
+  pop  r16
+  pop  r17
+  pop  r18
+  pop  r19
+  pop  r20
+  pop  r21
+  pop  r22
+  pop  r23
+context_restore_r24:
+  pop  r24
+  pop  r25
+context_restore_r26:
+  pop  r26
+  pop  r27
+  pop  r28
+  pop  r29
+  pop  r30
+  pop  r31
+  sbrs r31,7 ; test I-bit, skip next instruction if set
+  rjmp switch_normal_ret ; I-bit cleared, no special return
+  ; if we end up here, I-bit is set
+  andi r31,0x7f ; clear the I-bit to defer reenabling of interrupt
+  out  _SFR_IO_ADDR(SREG),r31 ; restore SREG but do not enable interrupt
+  pop  r31 ; restore r31
+  ; at this point, the context of the current thread is restored
+  ; a mere return should return to where it left off
+  reti ; we knew that i-bit was set, so return from interrup to enable int
+switch_normal_ret: ; normal return with I-bit cleared
+  out  _SFR_IO_ADDR(SREG),r31
+  pop  r31
+  ret
+
+; init_rtk(struct thread *, struct queue *), 
+;   initializes RTK, assigns priority to
+;   calling thread (first thread)
+.global rtkInitialize
+rtkInitialize:
+init_rtk:
+  ; preserve registers
+  push r31
+  in   r31,_SFR_IO_ADDR(SREG)
+  cli
+  push r31
+  push r30
+  push r29
+  push r28
+  push r27
+  push r26
+  push r25
+  push r24
+  ; parameter thread expected in r25:24
+  ; parameter queue expected in r23:22
+  ; initialize scheduled to be empty
+  clr  r24
+  sts  scheduled+queue_head,r24
+  sts  scheduled+queue_head+1,r24
+
+  ; initialize elements in queues to point to next
+  ldi  r24,RTK_NUMQUEUES ; r24 is a counter
+  ldi  r28,lo8(queues) 
+  ldi  r29,hi8(queues)
+  ; Y points to the first queue in queues
+  clr  r25
+init_queue:
+  ; initialize queue head (empty)
+  std  Y+queue_head,r25
+  std  Y+queue_head+1,r25
+  ; initialize next
+  mov  r26,r28
+  mov  r27,r29
+  adiw r26,queue_size
+  ; X is the address of the next queue
+  ; make this queue points to the next
+  std  Y+queue_next,r26
+  std  Y+queue_next+1,r27
+  ; advance queue pointer
+  mov  r28,r26
+  mov  r29,r27
+  ; decrement count
+  dec  r24
+  ; are we done yet? if not, do this again!
+  brne init_queue
+
+  ; initialize the last time (zap it's next)
+  sbiw r28,queue_size ; Y is one item past the end, back up first
+  std  Y+queue_next,r25 ; clear the next pointer because this is the last
+  std  Y+queue_next+1,r25
+  ; initialize tickount to be zero
+  ; TODO: user may want to specify the start tick_ount...
+  ldi  r26,lo8(rtkTickCount)
+  ldi  r27,hi8(rtkTickCount)
+  ; X points to tick_count
+  st   X+,r25
+  st   X+,r25
+  st   X+,r25
+  st   X+,r25
+  st   X+,r25
+  st   X+,r25
+  ; now restore r25:24
+  pop  r24
+  pop  r25
+  ; make current_thread the new thread
+  sts  current_thread,r24
+  sts  current_thread+1,r25
+  ; add the new thread to the designated queue
+  mov  r28,r24
+  mov  r29,r25
+  ; Y points to a thread
+  ; make thread points to itself in a circular queue
+  push r22
+  ldi  r22,RTK_THREADREADY
+  std  Y+thread_flags,r22
+  pop  r22
+  std  Y+thread_next,r24
+  std  Y+thread_next+1,r25
+  std  Y+thread_prev,r24
+  std  Y+thread_prev+1,r25
+  ; specify default ready queue for this thread
+  std  Y+thread_queue,r22
+  std  Y+thread_queue+1,r23
+
+  ; add the thread to the queue
+  mov  r26,r22
+  mov  r27,r23
+  adiw r26,queue_head
+  st   X+,r24
+  st   X+,r25
+  rjmp context_restore_r26
+
+attach_thread:
+  ; Z should point to the thread being attached
+  ; X and Y should be available
+  ; destroys r24
+  ; attaches to the tail of a queue
+  ldd  r26,Z+thread_queue
+  ldd  r27,Z+thread_queue+1
+  ldi  r24,RTK_THREADREADY
+  std  Z+thread_flags,r24
+attach_thread1: 
+  ; assume X is already loaded with queue address
+  ; now X points to the queue to which the thread belongs to
+  ; X and Y should be available
+  adiw r26,queue_head
+  ld   r28,X+
+  ld   r29,X+
+  ; now Y is a copy of queue_head
+  mov  r24,r28
+  or   r24,r29
+  breq attach_empty_queue_cont ; the queue is empty, easy case
+  ; attach to nonempty thread
+  ; first, fix next of the new node
+  ; since the new node is the last, it's next is the head in
+  ; a circular queue
+  std  Z+thread_next,r28
+  std  Z+thread_next+1,r29
+  ; next, fix prev of the new node to be prev of the head
+  ldd  r24,Y+thread_prev
+  std  Z+thread_prev,r24
+  ldd  r24,Y+thread_prev+1
+  std  Z+thread_prev+1,r24
+  ; third, fix prev of the head node to be the new node
+  std  Y+thread_prev,r30
+  std  Y+thread_prev+1,r31
+  ; fourth, fix next of prev. node to be the new node
+  ldd  r28,Z+thread_prev
+  ldd  r29,Z+thread_prev+1
+  ; Y points to the previous node
+  std  Y+thread_next,r30
+  std  Y+thread_next+1,r31
+  ; note that we do not change the head of the thread!
+  ret
+
+attach_empty_queue:
+  adiw r26,queue_head+2
+  
+attach_empty_queue_cont:
+  std  Z+thread_prev,r30 ; new node points to itself
+  std  Z+thread_prev+1,r31 ; in a circular queue with
+  std  Z+thread_next,r30 ; one item
+  std  Z+thread_next+1,r31
+  st   -X,r31 ; make queue head point to new node
+  st   -X,r30
+  ret
+
+; add thread(struct thread *, struct queue *, void *, void (*)(), void *), adds
+;   new thread to a queue, given starting SP (highest address of
+;   allocated space) and starting point, initial register values are
+;   undefined, except for the frame pointer Y
+.global rtkThreadAdd
+rtkThreadAdd:
+add_thread:
+  ; r25:24 thread
+  ; r23:22 queue
+  ; r21:20 stack top
+  ; r19:18 func
+  ; r17:16 pointer
+  ; save registers
+  push r31
+  in   r31,_SFR_IO_ADDR(SREG)
+  cli
+  push r31
+  push r30
+  push r29
+  push r28
+  push r27
+  push r26
+  push r25
+  push r24
+  mov  r30,r24
+  mov  r31,r25
+  ; now Z points to thread
+  std  Z+thread_queue,r22 ; initialize default ready queue of thread
+  std  Z+thread_queue+1,r23
+  rcall attach_thread ; attach this thread as last item of the queue
+  mov  r26,r20
+  mov  r27,r21
+  ; X is the top of stack now
+  st   -X,r18 ; PCL
+  st   -X,r19 ; PCH
+  st   -X,r31 ; this r31 is useless
+  in   r24,_SFR_IO_ADDR(SREG) ; save SREG
+  ori  r24,0x80 ; enable interrupt for this new thread
+  st   -X,r24 ; status register value
+  ; TODO: the frame pointer should be initialized!
+  sbiw r26,5 ; register values are undefined from r30 to r26
+  st   -X,r17 ;
+  st   -X,r16 ; void pointer is preserved as r25:24
+  sbiw r26,22 ; r23 to r2 are undefined
+  clr   r1
+  st   -X,r1 ; r1 is the zero_reg, kind of special
+  st   -X,r0 ; r0 we don't really care
+  ; now store the SP to thread struct
+  sbiw r26,1 ; the stack pointer points to the next avail. byte
+  std  Z+thread_SP,r26 ; initialize start location of SP 
+  std  Z+thread_SP+1,r27
+  ldi  r24,RTK_THREADREADY
+  std  Z+thread_flags,r24
+;  pop  r24
+;  out  SREG-__SFR_OFFSET,r24
+  rjmp  switch_context_r23 ; potential need to switch context
+  ; the following code is unreachable
+;  pop  r24
+;  pop  r25
+;  pop  r26
+;  pop  r27
+;  pop  r28
+;  pop  r29
+;  pop  r30
+;  pop  r31
+;  ret
+
+; remove thread(struct thread *), removes/terminate current thread if NULL
+;   for embedded apps, this may not be very useful
+
+.global rtkThreadSuicide
+rtkThreadSuicide:
+  ; remove the current thread from its ready queue, 
+  ; never to attach it to anything again!
+  cli ; disable interrupt
+  lds  r30,rtkCurrentThread
+  lds  r31,rtkCurrentThread+1
+  ; now Z points to the current thread, the one to be killed
+  ldd  r26,Z+thread_queue
+  ldd  r27,Z+thread_queue+1
+  ; now X points to the ready queue
+  adiw r26,queue_head
+  ; now X points to the thread head of the current thread's ready queue
+  rcall detach_thread ; detaches thread pointed to by Z from the queue
+  ; no need to save context, just ask RTK to find the next available thread
+  ldi  r24,RTK_THREADKILLED
+  std  Z+thread_flags,r24
+  rjmp kernel_core
+
+.global rtkThreadKill
+rtkThreadKill:
+  ; r25:24 thread to kill
+  ; r23:22 queue to kill from
+  ; remove a thread (must not be the current one) from a queue
+  push r31
+  in   r31,_SFR_IO_ADDR(SREG)
+  cli
+  push r31
+  push r30
+  push r29
+  push r28
+  push r27
+  push r26
+
+  mov  r30,r24
+  mov  r31,r25
+  ; Z points to the thread to remove
+
+  mov  r26,r22
+  mov  r27,r23
+  adiw r26,queue_head
+
+  rcall detach_thread
+  ldi  r26,RTK_THREADKILLED
+  std  Z+thread_flags,r26
+
+  rjmp context_restore_r26
+
+; reprioritize(struct thread *, struct queue *), moves a 
+;   thread to another queue, may not be useful
+
+; schedule thread(struct thread *, char[6])  (like add, but sorted by due time)
+;   if first arg is NULL, current thread is assumed, the thread should be
+;   ready in a priority queue and NO WHERE ELSE, that is, the thread
+;   should not be scheduled already or waiting on a semaphore P operation.
+.global rtkThreadSchedule
+rtkThreadSchedule:
+schedule_thread:
+  ; r25:24: thread
+  ; r23:22: address of the counter
+  push r31
+  in   r31,_SFR_IO_ADDR(SREG)
+  cli
+  push r31
+  push r30
+  push r29
+  push r28
+  push r27
+  push r26
+  push r25
+  push r24
+  push r23
+  push r22
+
+  mov  r30,r24
+  mov  r31,r25
+  ; remmeber this thread is now waiting
+  ldi  r26,RTK_THREADSCHEDULED
+  std  Z+thread_flags,r26
+  ; Z now points to the thread
+  ldd  r26,Z+thread_queue
+  ldd  r27,Z+thread_queue+1
+  adiw r26,queue_head
+  ; X is the address of a queue_head
+  rcall detach_thread ; remove thread from ready queue
+  ; now we are ready to put this thread into the scheduled queue
+  mov  r26,r22
+  mov  r27,r23
+  ; X now points to trigger tick count
+  ; put time to thread_time field of thread
+  ld   r24,X+
+  std  Z+thread_time,r24
+  ld   r24,X+
+  std  Z+thread_time+1,r24
+  ld   r24,X+
+  std  Z+thread_time+2,r24
+  ld   r24,X+
+  std  Z+thread_time+3,r24
+  ld   r24,X+
+  std  Z+thread_time+4,r24
+  ld   r24,X+
+  std  Z+thread_time+5,r24
+
+  ; find the right spot to insert this thread
+  lds  r28,scheduled+queue_head
+  lds  r29,scheduled+queue_head+1
+  ; Y is a copy of the queue head of scheduled
+  mov  r24,r28
+  or   r24,r29
+  brne scan_scheduled
+  ; nothing is scheduled, just attach this item and we're done!
+  ldi  r26,lo8(scheduled)
+  ldi  r27,hi8(scheduled)
+  rcall attach_empty_queue
+  rjmp schedule_finished
+scan_scheduled:
+  ; some thread(s) is/are already scheduled, we need to scan and find
+  ; the correct spot, compare new node to queue item
+  ldd  r24,Z+thread_time
+  ldd  r25,Y+thread_time
+  cp   r24,r25
+  ldd  r24,Z+thread_time+1
+  ldd  r25,Y+thread_time+1
+  cpc  r24,r25
+  ldd  r24,Z+thread_time+2
+  ldd  r25,Y+thread_time+2
+  cpc  r24,r25
+  ldd  r24,Z+thread_time+3
+  ldd  r25,Y+thread_time+3
+  cpc  r24,r25
+  ldd  r24,Z+thread_time+4
+  ldd  r25,Y+thread_time+4
+  cpc  r24,r25
+  ldd  r24,Z+thread_time+5
+  ldd  r25,Y+thread_time+5
+  cpc  r24,r25
+  brcs schedule_insert ; new node has a smaller time, insert before queue item
+  ; not time to insert, just yet
+  ; move to the next item
+  ldd  r24,Y+thread_next
+  ldd  r29,Y+thread_next+1
+  mov  r28,r24
+  ; check to see we're at the end
+  lds  r24,scheduled+queue_head
+  cp   r24,r28
+  lds  r24,scheduled+queue_head+1
+  cpc  r24,r29
+  breq insert_thread; append as last item
+  ; go back and check for the right spot again
+  rjmp scan_scheduled
+
+schedule_insert:
+  ; insert Z before Y, possibly update queue_head
+  lds  r24,scheduled+queue_head
+  cp   r24,r28
+  lds  r24,scheduled+queue_head+1
+  cpc  r24,r29
+  brne insert_thread
+  ; update queue_head to point to new thread
+  sts  scheduled+queue_head,r30
+  sts  scheduled+queue_head+1,r31
+
+insert_thread:
+  ; insert Z before Y, but do not modify queue_head of scheduled
+  ; first, update the prev link of the new node to prev of queue item
+  ldd  r24,Y+thread_prev
+  std  Z+thread_prev,r24
+  ldd  r24,Y+thread_prev+1
+  std  Z+thread_prev+1,r24
+
+  ; next update the prev link of the queue item to new node
+  std  Y+thread_prev,r30
+  std  Y+thread_prev+1,r31
+
+  ; update the next link of the new node to queue item
+  std  Z+thread_next,r28
+  std  Z+thread_next+1,r29
+
+  ; update the next link of the old prev node
+  ldd  r28,Z+thread_prev
+  ldd  r29,Z+thread_prev+1
+  ; Y now points to the prev. node relative to the new node
+  ; update its next to point to the current node
+  std  Y+thread_next,r30
+  std  Y+thread_next+1,r31
+
+schedule_finished:
+  lds  r24,current_thread
+  cp   r30,r24
+  lds  r24,current_thread+1
+  cpc  r31,r24
+  brne schedule_return ; Z not the current thread, just return
+  ; the scheduled thread IS the current thread, time to change context
+
+  rjmp switch_context_r21
+
+schedule_return:
+  pop  r22
+  pop  r23
+  pop  r24
+  pop  r25
+  pop  r26
+  pop  r27
+  pop  r28
+  pop  r29
+  pop  r30
+  pop  r31
+  out  _SFR_IO_ADDR(SREG),r31 ; restore interrupt bit
+  pop  r31
+  ret
+
+; reschedule thread(struct thread *, char[6]) (may not be very useful)
+
+; semaphore init(struct semaphore *, char initial value)
+;   r25:24: pointer to semaphore structure
+; forgot to save and restore r28 and r29 (frame pointer), causing 
+; very weird problems because all local variables of the caller are
+; shifted to where the semaphore is located, writing to local variables
+; end up corrupting the semaphore
+.global rtkSemaphoreInitialize
+rtkSemaphoreInitialize:
+semaphore_init:
+  push r31
+  in   r31,_SFR_IO_ADDR(SREG)
+  cli
+  push r31
+  push r29
+  push r28
+  push r24
+  mov  r28,r24
+  mov  r29,r25
+  clr  r24
+  std  Y+semaphore_value,r22 ; initially locked? Can be useful for block/unblock
+  std  Y+semaphore_queue+queue_head,r24 ; and the wait queue is empty
+  std  Y+semaphore_queue+queue_head+1,r24
+  pop  r24
+  pop  r28
+  pop  r29
+  pop  r31
+  out  _SFR_IO_ADDR(SREG),r31
+  pop  r31
+  ret
+
+; semaphore lock(struct semaphore *)
+.global rtkSemaphoreP
+rtkSemaphoreP:
+semaphore_dolock:
+  push r31
+  in   r31,_SFR_IO_ADDR(SREG)
+  cli
+  push r31
+  push r30
+  push r29
+  push r28
+  push r27
+  push r26
+  push r25
+  push r24
+  mov  r28,r24
+  mov  r29,r25
+  ; Y points to the semaphore struct
+  ldd  r24,Y+semaphore_value
+  dec  r24
+  std  Y+semaphore_value,r24 ; decrement value
+  brpl semaphore_value_available
+semaphore_block:
+  ; locked already!
+  lds  r30,current_thread
+  lds  r31,current_thread+1
+  ; Z points to the current_thread
+  ; remember this thread is now waiting
+  ldi  r26,RTK_THREADWAIT
+  std  Z+thread_flags,r26
+  ; now detach the thread from its ready queue
+  ldd  r26,Z+thread_queue
+  ldd  r27,Z+thread_queue+1
+  adiw r26,queue_head
+  ; X is the address of queue_head of the default ready queue
+  push r29 ; save Y (points to the semaphore struct)
+  push r28
+  rcall detach_thread ; detach thread from ready queue
+  pop  r26 ; restore address of semaphore to X
+  pop  r27
+  adiw r26,semaphore_queue ; add offset to queue field of semaphore
+  rcall attach_thread1 ; attach to lock queue
+;  pop  r24 ; restore status register
+;  out  SREG-__SFR_OFFSET,r24
+  rjmp  switch_context_r23 ; change context
+
+semaphore_value_available:
+  pop  r24
+  pop  r25
+  pop  r26
+  pop  r27
+  pop  r28
+  pop  r29
+  pop  r30
+  pop  r31
+  out  _SFR_IO_ADDR(SREG),r31
+  pop  r31
+  ret
+
+#if 0
+.global rtkDummyP
+rtkDummyP:
+  ret
+  push r31
+  push r30
+  push r29
+  push r28
+  push r27
+  push r26
+  push r25
+  push r24
+  mov  r28,r24
+  mov  r29,r25
+  ; Y points to the semaphore struct
+  in   r24,_SFR_IO_ADDR(SREG)
+  push r24
+  cli
+  ldd  r24,Y+semaphore_value
+  dec  r24
+  inc  r24
+  std  Y+semaphore_value,r24 ; decrement value
+;  brpl  semaphore_value_available
+  rjmp  semaphore_value_available
+;  rjmp  semaphore_block
+;  brmi  semaphore_block
+;  rjmp  semaphore_block
+
+.global rtkDummyV
+rtkDummyV:
+  push r31
+  push r30
+  push r29
+  push r28
+  push r27
+  push r26
+  push r25
+  push r24
+  mov  r28,r24
+  mov  r29,r25
+  ; Y points to the semaphore struct
+  in   r24,_SFR_IO_ADDR(SREG)
+  push r24
+  cli
+  ldd  r24,Y+semaphore_value
+  inc  r24
+  std  Y+semaphore_value,r24 ; decrement value
+  rjmp  semaphore_value_available
+#endif
+
+; semaphore trylock(struct semaphore *)
+.global rtkSemaphoreTryP
+rtkSemaphoreTryP:
+semaphore_try_lock:
+  push r31
+  in   r31,_SFR_IO_ADDR(SREG)
+  cli
+  push r31
+  push r30
+  mov  r30,r24
+  mov  r31,r25
+  ldd  r24,Z+semaphore_value
+  tst  r24
+  breq semaphore_try_fail
+  brpl semaphore_try_succeed
+semaphore_try_fail:
+  ; unsuccessful try, do nothing and return 0
+  clr  r24
+  clr  r25
+  pop  r30
+  pop  r31
+  out  _SFR_IO_ADDR(SREG),r31
+  pop  r31
+  ret
+semaphore_try_succeed:
+  dec  r24 ; decrement semaphore value
+  std  Z+semaphore_value,r24
+  ; now it is locked
+  ; restore interrupt bit
+  ; returns 1 (r24 is already 1)
+  ldi  r24,1
+  clr  r25
+  pop  r30
+  pop  r31
+  out  _SFR_IO_ADDR(SREG),r31
+  pop  r31
+  ret
+
+
+; semaphore unlock(struct semaphore *, char CS=1)
+.global rtkSemaphoreVOpt
+rtkSemaphoreVOpt:
+semaphore_unlock:
+  push r31
+  in   r31,_SFR_IO_ADDR(SREG)
+  cli ; disable interrupt
+  push r31
+  push r30
+  push r29
+  push r28
+  push r27
+  push r26
+  push r25
+  push r24
+  ; Y points to the semaphore structure
+  ; Y points to the semaphore
+.global rtkSemaphoreVCont
+rtkSemaphoreVCont:
+  mov  r28,r24
+  mov  r29,r25
+  ldd  r24,Y+semaphore_value ; increment value of semaphore
+  inc  r24
+  std  Y+semaphore_value,r24
+
+rtkSemaphoreVGetHeadThread:
+  ldd  r30,Y+semaphore_queue+queue_head
+  ldd  r31,Y+semaphore_queue+queue_head+1
+  ; Z points to queue head
+  ; check whether the queue is empty
+  mov  r24,r30
+  or   r24,r31
+  breq semaphore_none_waiting ; no thread waiting, simple case
+  ; some thread is waiting for this lock, it should be made ready now
+  ; let's check if this thread is already dead!
+  ldd  r24,Z+thread_flags ; now r24 is the flag
+  cpi  r24,RTK_THREADKILLED ; TODO: maybe we should check for wait state
+  brne rtkSemaphoreVThreadReady
+  ; okay, this thread is already dead! Let's get the next thread and try
+  ; again
+  mov  r26,r28
+  mov  r27,r29
+  adiw r26,semaphore_queue+queue_head
+  ; X is address of head of queue of thread
+  push r28 ; save Y
+  push r29
+  rcall detach_thread ; from semaphore queue
+  pop  r29 ; restore Y
+  pop  r28
+  rjmp rtkSemaphoreVGetHeadThread
+
+rtkSemaphoreVThreadReady:
+
+  ; remember this thread is now ready
+  ldi  r24,RTK_THREADREADY
+  std  Z+thread_flags, r24
+  ; make the first thread in queue ready
+  ; Z points to the first thread
+;  ldd  r30,Y+semaphore_queue+queue_head
+;  ldd  r31,Y+semaphore_queue+queue_head+1
+  mov  r26,r28
+  mov  r27,r29
+  adiw r26,semaphore_queue+queue_head
+  ; X is address of head of queue of thread
+  rcall detach_thread ; from semaphore queue
+
+  ; Z still points to the thread
+  rcall attach_thread ; to default ready queue
+
+  ; then (potentially) switch context
+  tst   r22 ; check to see if we should context switch using the extra flag
+  breq  semaphore_none_waiting ; if not, just restore context
+  rjmp  switch_context_r23 ; else go for a context switch
+
+semaphore_none_waiting: 
+  rjmp  context_restore_r24
+  ; no one else is waiting, just reset the lock and return
+
+; tick(void), wraps around switch_context
+
+  
+detach_thread0:
+  ; like detach_thread, but X is now loaded with the default queue
+  
+detach_thread:
+  ; X should be address of the head of a queue
+  ; Y should be available
+  ; Z should point to the thread being detached
+  ; destroys r24
+  ; now move the thread from schedule queue to its original queue
+  ; first remove it from the schedule queue
+  ldd  r28,Z+thread_next
+  ldd  r29,Z+thread_next+1
+  ; Y points to the next thread of thread to be detached
+  cp   r28,r30
+  cpc  r29,r31
+  brne not_last_item
+  ; last and only remaining item
+  ; indicate the queue is now empty
+  clr  r24
+  st   X+,r24
+  st   X+,r24
+  ret
+
+not_last_item:
+  ; update the head if this is, in fact, the head!
+  ld   r24,X+
+  cp   r30,r24
+  ld   r24,X+
+  cpc  r31,r24
+  brne detach_thread_finished ; if Z does not point to what X points to, leave
+  ; otherwise, update head with the next thread of Z's!
+  st   -X,r29
+  st   -X,r28
+detach_thread_finished:
+
+  ; Y has the next item's address
+  ; update the next item to point to my prev item
+  ldd  r24,Z+thread_prev
+  std  Y+thread_prev,r24
+  ldd  r24,Z+thread_prev+1
+  std  Y+thread_prev+1,r24
+
+  ldd  r28,Z+thread_prev
+  ldd  r29,Z+thread_prev+1
+  ; Y has the prev item's address
+  ; update the prev. item's next to point to my next item
+  ldd  r24,Z+thread_next
+  std  Y+thread_next,r24
+  ldd  r24,Z+thread_next+1
+  std  Y+thread_next+1,r24
+
+  ret
+
+.global rtkTickFunction
+rtkTickFunction:
+
+
+; the following definition is obsoleted because a built-in one in 
+; timer.S makes it more efficient
+#if 1
+.global rtkTickCountInc
+rtkTickCountInc:
+  push r31
+  push r30
+  push r29
+  push r28
+  in   r28,_SFR_IO_ADDR(SREG)
+  push r28
+  cli
+  ldi  r30,lo8(rtkTickCount)
+  ldi  r31,hi8(rtkTickCount)
+  ld   r29,Z
+  ldi  r28,1
+  add  r29,r28
+  st   Z+,r29
+  ldi  r28,0
+  ld   r29,Z
+  adc  r29,r28
+  st   Z+,r29
+  ld   r29,Z
+  adc  r29,r28
+  st   Z+,r29
+  ld   r29,Z
+  adc  r29,r28
+  st   Z+,r29
+  ld   r29,Z
+  adc  r29,r28
+  st   Z+,r29
+  ld   r29,Z
+  adc  r29,r28
+  st   Z+,r29
+  pop  r28
+  out  _SFR_IO_ADDR(SREG),r28
+  pop  r28
+  pop  r29
+  pop  r30
+  pop  r31
+  ret
+#endif
+
+.global rtkTickCountGet
+rtkTickCountGet:
+  push r31
+  in   r31,_SFR_IO_ADDR(SREG)
+  cli
+  push r31
+  push r30
+  push r29
+  push r28
+  push r16
+  mov  r30,r24
+  mov  r31,r25
+  ldi  r28,lo8(rtkTickCount)
+  ldi  r29,hi8(rtkTickCount)
+  ld   r16,Y+
+  st   Z+,r16
+  ld   r16,Y+
+  st   Z+,r16
+  ld   r16,Y+
+  st   Z+,r16
+  ld   r16,Y+
+  st   Z+,r16
+  ld   r16,Y+
+  st   Z+,r16
+  ld   r16,Y+
+  st   Z+,r16
+  pop  r16
+  pop  r28
+  pop  r29
+  pop  r30
+  pop  r31
+  out  _SFR_IO_ADDR(SREG),r31
+  pop  r31
+  ret
+
+.global tickAdd4
+tickAdd4:
+  push r31
+  push r30
+  push r20
+  push r16
+  mov  r30,r24
+  mov  r31,r25
+  ; Z points to the tick structure
+  ld   r16,Z
+  add  r16,r20
+  st   Z+,r16
+  ld   r16,Z
+  adc  r16,r21
+  st   Z+,r16
+  ld   r16,Z
+  adc  r16,r22
+  st   Z+,r16
+  ld   r16,Z
+  adc  r16,r23
+  st   Z+,r16
+  clr  r20
+  ld   r16,Z
+  adc  r16,r20
+  st   Z+,r16
+  ld   r16,Z
+  adc  r16,r20
+  st   Z+,r16
+  pop  r16
+  pop  r20
+  pop  r30
+  pop  r31
+  ret
+
+; preemption from isrs
+; it is important to be able to preempt threads from an ISR. one application
+; is to time slice threads of the same priority. another application is to
+; allow very fast ISRs that defer complicated logic to blocked threads
+;
+; an ISR that may preempt threads should do the following steps:
+; 1. save initial registers for ISR specific logic
+; 2. perform ISR specific logic, hopefully short
+; 2a. reenable interrupt here
+; 3. jump to unblock (use rtkSemaphoreV) an awaiting thread, depending
+;    on saved registers, jump to the middle of the unlock function
+; 4. if there is no thread to unblock, return
+; 
+; the tricky part here is to enable interrupts when we save the 
+; status register. This is necessary to let the interrupted thread
+; continue its execution as if the interrupt never occurred
+;
+; note that this also implies the that the ISR specific logic should not
+; use more registers than what the rtkMutexUnlock subroutine saves Otherwise,
+; the extra registers need to be saved and restored before jumping to
+; rtkSemaphoreV
+; note that semaphores can handle queues in the case of an UART. The ISR
+; can repeatedly rtkSemaphoreV to increment the semaphore. When the
+; programs gets to block at a rtkSemaphoreP in the UART handling thread,
+; the call immediately returns
+;
+; for preemptive multitasking and ISR unblocking, 
+; a more wasteful but more straightforward approach is to CALL
+; rtkThreadYield or rtkSemaphoreV from an ISR. The good thing about this
+; is that there is no need to do hooky logic within the ISR. The bad
+; side, of course, is that some registers will end up being saved more
+; than once (once saved by the prolog of the ISR, once saved by 
+; rtkThreadYield or rtkSemaphoreV). 
+;
+; if this approach is to be used, each Thread needs a tick count that
+; decrements for each timer ISR invocation. 
+; when this count reaches zero, the thread calls rtkThreadYield.
+;
+;
+; the rtk should allow `simple' calls to thread-free functions on a per
+; ISR invocation basis. the ISR base frequency can then be divided as
+; the tick frequency. preemption occurs at a fraction of the tick
+; frequency. This way, the overhead of thread switching is only paid for
+; more complex threads, while simple functions that do not require
+; a thread can execute more frequently with more efficiency
