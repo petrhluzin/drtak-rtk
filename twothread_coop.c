@@ -1,5 +1,6 @@
 #include <avr/io.h>
 #include <avr/interrupt.h>
+#include <avr/signature.h>
 #include "timer.h"
 #include "rtk.h"
 
