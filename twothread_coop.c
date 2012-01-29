@@ -1,6 +1,5 @@
 #include <avr/io.h>
-#include <avr/ina90.h>
-#include <avr/signal.h>
+#include <avr/interrupt.h>
 #include "timer.h"
 #include "rtk.h"
 
@@ -22,9 +21,9 @@ thread2(void *p)
 int main(void)
 {
   // ... code before rtk is active
-  output(DDRG, input(DDRG) | 0x18); // set pins to LEDs to output
-  output(PORTG, (input(PORTG) | 0x18)); // turn off both LEDs
-  output(MCUCR, (input(MCUCR) & ~0x10) | 0x20); // enable idle mode
+  DDRG = DDRG | 0x18; // set pins to LEDs to output
+  PORTG = PORTG | 0x18; // turn off both LEDs
+  MCUCR = (MCUCR & ~0x10) | 0x20; // enable idle mode
 
   // set up time slice parameters
   rtkSliceScaler = 100; // preemption time slice is 100 ISR invocations
