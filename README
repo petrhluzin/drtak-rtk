@@ -1,0 +1,25 @@
+=========================================================
+Dr. Tak's Real Time Kernel (DTRTK) for the Atmel AVR MCUs
+by Tak Auyeung, Ph.D.
+http://www.drtak.org/develops/RTK/
+=========================================================
+
+This branch (fork?) contains my experiments. It is not useful for general public.
+
+
+### pouzil by originalni gas: avr-gcc -c -ggdb3 -mmcu=atmega128 -D__ASM__ -x assembler-with-cpp -Wa,--gdwarf2  rtk.SX  -o rtk.obj
+avr-gcc -ggdb3 -mmcu=atmega128 -Wall -c twothread_coop.c -o twothread_coop.obj -DTICK_FREQ=1000 -DISR_FREQ=5000 -DTIMER_ISR=SIG_OUTPUT_COMPARE2
+avr-gcc -ggdb3 -mmcu=atmega128 -Wall -c twothread_coop.c -o twothread_coop.obj
+avr-gcc -ggdb3 -mmcu=atmega128 -D__ASM__ -x assembler-with-cpp -Wa,--gdwarf2  rtk.SX  -o rtk.preprocessed -E
+avr-gcc -ggdb3 -mmcu=atmega128 -D__ASM__ -x assembler-with-cpp -Wa,--gdwarf2  rtk.SX  -o rtk.obj
+../binutils-2.20/gas/as-new.exe -mmcu=atmega128 --gdwarf2 -o rtk.obj rtk.preprocessed
+avr-gcc -ggdb3 -mmcu=atmega128 -Wall  rtk.obj twothread_coop.obj -o 2thread-coop.elf
+
+# prekladat s "-Wa,--gdwarf2", viz http://tigcc.ticalc.org/doc/gnuasm.html
+# mozna prekladat s "-Wa,--gen-debug", nebo ekvivalentne s "-Wa,-g"
+# vyzkouset jestli -fno-dwarf2-cfi-asm ma pozitivni nebo negativni vliv
+
+G:\backups\projects\simulavrxx\Debug\simulavr.exe --device atmega128 --gdbserver
+
+avr-objdump --all-headers --disassemble --source --syms 2thread-coop.elf
+
