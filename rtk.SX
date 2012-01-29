@@ -244,7 +244,7 @@ find_nonempty_queue:
   ldi  r30,lo8(queues) ; queues is an array of queue structs
   ldi  r31,hi8(queues) ; just get its address to get to the first item
   ; Z points to the first priority queue (highest priority)
-check_queue:
+check_queue_loop:
   mov  r0,r30
   or   r0,r31
   breq no_thread_is_ready ; even the lowest priority queue is empty
@@ -259,7 +259,7 @@ check_queue:
   ldd  r0,Z+queue_next
   ldd  r31,Z+queue_next+1
   mov  r30,r0
-  rjmp check_queue
+  rjmp check_queue_loop
 
 no_thread_is_ready:
   ; TODO: this logic may not be correct!
@@ -397,7 +397,7 @@ rtkInitialize:
   ldi  r29,hi8(queues)
   ; Y points to the first queue in queues
   clr  r25
-init_queue:
+init_queue_loop:
   ; initialize queue head (empty)
   std  Y+queue_head,r25
   std  Y+queue_head+1,r25
@@ -415,7 +415,7 @@ init_queue:
   ; decrement count
   dec  r24
   ; are we done yet? if not, do this again!
-  brne init_queue
+  brne init_queue_loop
 
   ; initialize the last time (zap it's next)
   sbiw r28,queue_size ; Y is one item past the end, back up first
