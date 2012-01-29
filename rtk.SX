@@ -170,7 +170,7 @@ switch_context_r21:
 ;  ldi  r16, RTK_THREADREADY
 ;  std  Z+thread_flags,r16
 
-  ; at this point, the context of the current thread is saved
+  ; At this point, the context of the current thread has been saved.
   ; time to figure out the next thread to run
 
   ; note that we do not advance the queue head or detach a thread
@@ -181,7 +181,7 @@ switch_context_r21:
   ; for each thread stack
 kernel_core:
   ldi  r16,hi8(kernel_high_SP-1)
-  out  _SFR_IO_ADDR(SPH),r16
+  out  _SFR_IO_ADDR(SPH),r16     ;;; Switch to kernel's stack. The old SP is usually saved earlier.
   ldi  r16,lo8(kernel_high_SP-1)
   out  _SFR_IO_ADDR(SPL),r16
 
@@ -261,7 +261,7 @@ check_queue_loop:
   mov  r30,r0
   rjmp check_queue_loop
 
-no_thread_is_ready:
+no_thread_is_ready:  ;;; reachable only from find_nonempty_queue()
   ; TODO: this logic may not be correct!
 
   ; no thread is ready at this point, got nothing to do!
@@ -279,7 +279,7 @@ no_thread_is_ready:
   ; be ready
   rjmp find_scheduled ; check of scheduled threads again
   
-use_this_queue:
+use_this_queue:  ;;; reachable only from find_nonempty_queue()
   ; Y points to the thread
   ; first, advance the queue head
   ldi  r16,RTK_THREADREADY
@@ -306,7 +306,7 @@ use_this_queue:
   adiw r26,thread_SP
   ; X points to the SP
   ld   r0,X+
-  out  _SFR_IO_ADDR(SPL),r0
+  out  _SFR_IO_ADDR(SPL),r0 ;;; Switch to stack of `current_thread' and abandon kernel's stack
   ld   r0,X+
   out  _SFR_IO_ADDR(SPH),r0
   ; note that interrupt may be reenabled here!
