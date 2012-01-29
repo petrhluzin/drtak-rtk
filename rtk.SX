@@ -196,12 +196,10 @@ find_scheduled:
   ; Z is a copy of the head of the scheduled queue
   mov  r0,r30
   or   r0,r31
-  brne scheduled_not_empty
-  rjmp find_nonempty_queue ; if this is empty, look for ready threads
+  breq find_nonempty_queue ; if this is empty, look for ready threads
 
   ; otherwise, check the thread at the head to see if it is time to
   ; make it ready
-scheduled_not_empty:
   mov  r28,r30
   mov  r29,r31
   adiw r28,thread_time
@@ -369,12 +367,11 @@ switch_normal_ret: ; normal return with I-bit cleared
   pop  r31
   ret
 
-; init_rtk(struct thread *, struct queue *), 
+; rtkInitialize(struct thread *, struct queue *), 
 ;   initializes RTK, assigns priority to
 ;   calling thread (first thread)
 .global rtkInitialize
 rtkInitialize:
-init_rtk:
   ; preserve registers
   push r31
   in   r31,_SFR_IO_ADDR(SREG)
