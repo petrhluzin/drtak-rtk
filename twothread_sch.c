@@ -1,6 +1,6 @@
 #include <avr/io.h>
-#include <avr/ina90.h>
-#include <avr/signal.h>
+#include <avr/interrupt.h>
+#include <avr/signature.h>
 #include "timer.h"
 #include "rtk.h"
 
@@ -13,10 +13,10 @@ static char newStack[128];
 static void
 setTimer2(void)
 {
-  output(TIMSK, (input(TIMSK) & 0x3f) | 0x80);
-  output(TCNT2,0);
-  output(OCR2, 49);
-  output(TCCR2,0x0b);
+  TIMSK = TIMSK & 0x3f | 0x80;
+  TCNT2 = 0;
+  OCR2 = 49;
+  TCCR2 = 0x0b;
 }
 
 // be sure to specify the following when you compile:
@@ -41,9 +41,9 @@ thread2(void *p)
 int main(void)
 {
   // ... code before rtk is active
-  output(DDRG, input(DDRG) | 0x18); // set pins to LEDs to output
-  output(PORTG, (input(PORTG) | 0x18)); // turn off both LEDs
-  output(MCUCR, (input(MCUCR) & ~0x10) | 0x20); // enable idle mode
+  DDRG = DDRG | 0x18; // set pins to LEDs to output
+  PORTG = PORTG | 0x18; // turn off both LEDs
+  MCUCR = (MCUCR & ~0x10) | 0x20; // enable idle mode
 
   // set up time slice parameters
   rtkSliceScaler = 100; // preemption time slice is 100 ISR invocations

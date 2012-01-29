@@ -1,6 +1,6 @@
 #include <avr/io.h>
-#include <avr/ina90.h>
-#include <avr/signal.h>
+#include <avr/interrupt.h>
+#include <avr/signature.h>
 #include "timer.h"
 #include "rtk.h"
 
@@ -11,10 +11,10 @@ static struct Thread mainThread; // static because it doesn't need to
 static void
 setTimer2(void)
 {
-  output(TIMSK, (input(TIMSK) & 0x3f) | 0x80);
-  output(TCNT2,0);
-  output(OCR2, 49);
-  output(TCCR2,0x0b);
+  TIMSK = (TIMSK & 0x3f) | 0x80;
+  TCNT2 = 0;
+  OCR2 = 49;
+  TCCR2 = 0x0b;
 }
 
 // be sure to specify the following when you compile:
